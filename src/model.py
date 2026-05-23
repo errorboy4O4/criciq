@@ -112,17 +112,41 @@ def evaluate_model(model, X_train, y_train, X_test, y_test):
 
 
 def print_feature_importance(model):
-    """Print feature importance ranking."""
+    """Print and save feature importance chart."""
+
+    import plotly.express as px
 
     importance = pd.DataFrame({
         "feature": FEATURE_COLS,
         "importance": model.feature_importances_,
-    }).sort_values("importance", ascending=False)
+    }).sort_values("importance", ascending=True)
 
     print("\n--- Feature Importance ---")
-    for _, row in importance.iterrows():
+    for _, row in importance.sort_values("importance", ascending=False).iterrows():
         bar = "█" * int(row["importance"] * 50)
         print(f"  {row['feature']:<25} {row['importance']:.3f}  {bar}")
+
+    # Save as image
+    fig = px.bar(
+        importance,
+        x="importance",
+        y="feature",
+        orientation="h",
+        title="CricIQ — XGBoost Feature Importance",
+        labels={"importance": "Importance Score", "feature": "Feature"},
+    )
+    fig.update_layout(
+        height=500,
+        width=800,
+        font=dict(size=14),
+        title_font_size=20,
+        margin=dict(l=20, r=20, t=60, b=20),
+    )
+
+    os.makedirs(os.path.join(os.path.dirname(__file__), "..", "assets"), exist_ok=True)
+    chart_path = os.path.join(os.path.dirname(__file__), "..", "assets", "feature_importance.png")
+    fig.write_image(chart_path, scale=2)
+    print(f"\nFeature importance chart saved to: {chart_path}")
 
     return importance
 
