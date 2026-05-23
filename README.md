@@ -173,7 +173,7 @@ streamlit run src/app.py
 
 ## Author
 
-**Kaushik Gaur** — [GitHub](https://github.com/errorboy404)
+**Kaushik Gaur** — [GitHub](https://github.com/errorboy4O4)
 
 Built in 7 days as a data science portfolio project.
 
