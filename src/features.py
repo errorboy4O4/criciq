@@ -3,6 +3,7 @@ features.py - Calculate Dream11 fantasy points from ball-by-ball data
 """
 
 import pandas as pd
+import numpy as np
 import os
 
 PROCESSED_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "processed")
@@ -261,6 +262,236 @@ def calc_total_fantasy_points(deliveries):
 
     return total
 
+# ============================================================
+# FEATURE ENGINEERING
+# ============================================================
+
+def add_match_info(fantasy, deliveries, matches):
+    """Add venue, teams, date, season to each player-match row."""
+
+    # Get match-level info
+    match_info = deliveries.groupby("match_id").agg(
+        venue=("venue", "first"),
+        city=("city", "first"),
+        season_year=("season_year", "first"),
+        date=("date", "first"),
+    ).reset_index()
+
+    # Get the two teams in each match
+    match_teams = deliveries.groupby("match_id")["batting_team"].unique().reset_index()
+    match_teams.columns = ["match_id", "teams"]
+
+    # Get which team each player batted for
+    bat_teams = deliveries.groupby(["match_id", "batter"])["batting_team"].first().reset_index()
+    bat_teams.columns = ["match_id", "player", "team"]
+
+    # Get which team each player bowled for (bowler's team = bowling_team)
+    bowl_teams = deliveries.groupby(["match_id", "bowler"])["bowling_team"].first().reset_index()
+    bowl_teams.columns = ["match_id", "player", "team_from_bowling"]
+
+    # Merge match info
+    fantasy = fantasy.merge(match_info, on="match_id", how="left")
+
+    # Merge batting team
+    fantasy = fantasy.merge(bat_teams, on=["match_id", "player"], how="left")
+
+    # For players who only bowled, fill team from bowling data
+    fantasy = fantasy.merge(bowl_teams, on=["match_id", "player"], how="left")
+    fantasy["team"] = fantasy["team"].fillna(fantasy["team_from_bowling"])
+    fantasy.drop(columns=["team_from_bowling"], inplace=True)
+
+    # Get opposition: the other team in this match
+    fantasy = fantasy.merge(match_teams, on="match_id", how="left")
+    fantasy["opposition"] = fantasy.apply(
+        lambda row: [t for t in row["teams"] if t != row["team"]][0]
+        if len(row["teams"]) == 2 and row["team"] in list(row["teams"])
+        else "Unknown",
+        axis=1,
+    )
+    fantasy.drop(columns=["teams"], inplace=True)
+
+    # Sort by player and date for rolling calculations
+    fantasy["date"] = pd.to_datetime(fantasy["date"])
+    fantasy = fantasy.sort_values(["player", "date", "match_id"]).reset_index(drop=True)
+
+    return fantasy
+
+
+def add_rolling_features(fantasy):
+    """Add rolling window features: last 5 match form."""
+
+    fantasy = fantasy.sort_values(["player", "date"]).reset_index(drop=True)
+
+    # Group by player and calculate rolling stats
+    grouped = fantasy.groupby("player")
+
+    # Rolling average runs (last 5 matches)
+    fantasy["rolling_avg_runs_5"] = grouped["runs"].transform(
+        lambda x: x.shift(1).rolling(5, min_periods=1).mean()
+    )
+
+    # Rolling strike rate (last 5 matches)
+    fantasy["rolling_balls_5"] = grouped["balls_faced"].transform(
+        lambda x: x.shift(1).rolling(5, min_periods=1).sum()
+    )
+    fantasy["rolling_runs_for_sr_5"] = grouped["runs"].transform(
+        lambda x: x.shift(1).rolling(5, min_periods=1).sum()
+    )
+    fantasy["rolling_sr_5"] = (
+        fantasy["rolling_runs_for_sr_5"] / fantasy["rolling_balls_5"].replace(0, 1) * 100
+    )
+
+    # Rolling wickets (last 5 matches)
+    fantasy["rolling_wickets_5"] = grouped["wickets"].transform(
+        lambda x: x.shift(1).rolling(5, min_periods=1).mean()
+    )
+
+    # Rolling economy (last 5 matches)
+    fantasy["rolling_economy_5"] = grouped["runs_conceded"].transform(
+        lambda x: x.shift(1).rolling(5, min_periods=1).mean()
+    ) / grouped["overs"].transform(
+        lambda x: x.shift(1).rolling(5, min_periods=1).mean()
+    ).replace(0, 1)
+
+    # Rolling fantasy points (last 5 matches) — recent form index
+    fantasy["rolling_fp_5"] = grouped["fantasy_points"].transform(
+        lambda x: x.shift(1).rolling(5, min_periods=1).mean()
+    )
+
+    # Weighted recent form: match 1 (most recent) = weight 5, match 5 = weight 1
+    def weighted_form(series):
+        shifted = series.shift(1)
+        result = []
+        for i in range(len(shifted)):
+            window = shifted.iloc[max(0, i - 4):i + 1].dropna()
+            if len(window) == 0:
+                result.append(0)
+            else:
+                weights = list(range(1, len(window) + 1))
+                result.append(sum(w * v for w, v in zip(weights, window)) / sum(weights))
+        return result
+
+    fantasy["recent_form_index"] = grouped["fantasy_points"].transform(weighted_form)
+
+    # Clean up temp columns
+    fantasy.drop(columns=["rolling_balls_5", "rolling_runs_for_sr_5"], inplace=True)
+
+    return fantasy
+
+
+def add_venue_features(fantasy):
+    """Add venue-specific historical stats per player."""
+
+    fantasy = fantasy.sort_values(["player", "date"]).reset_index(drop=True)
+
+    # Career average runs at this venue (using only past data)
+    venue_stats = []
+    for _, group in fantasy.groupby(["player", "venue"]):
+        group = group.sort_values("date")
+        group["venue_avg_runs"] = group["runs"].shift(1).expanding().mean()
+        group["venue_avg_fp"] = group["fantasy_points"].shift(1).expanding().mean()
+        group["venue_matches"] = group["match_id"].shift(1).expanding().count()
+        venue_stats.append(group[["match_id", "player", "venue_avg_runs",
+                                   "venue_avg_fp", "venue_matches"]])
+
+    venue_df = pd.concat(venue_stats, ignore_index=True)
+    fantasy = fantasy.merge(venue_df, on=["match_id", "player"], how="left")
+
+    # Fill NaN (first time at venue) with overall player average
+    player_avg = fantasy.groupby("player")["runs"].transform(
+        lambda x: x.shift(1).expanding().mean()
+    )
+    fantasy["venue_avg_runs"] = fantasy["venue_avg_runs"].fillna(player_avg)
+    fantasy["venue_avg_fp"] = fantasy["venue_avg_fp"].fillna(
+        fantasy.groupby("player")["fantasy_points"].transform(
+            lambda x: x.shift(1).expanding().mean()
+        )
+    )
+    fantasy["venue_matches"] = fantasy["venue_matches"].fillna(0)
+
+    return fantasy
+
+
+def add_h2h_features(fantasy):
+    """Add head-to-head stats vs opposition team."""
+
+    fantasy = fantasy.sort_values(["player", "date"]).reset_index(drop=True)
+
+    h2h_stats = []
+    for _, group in fantasy.groupby(["player", "opposition"]):
+        group = group.sort_values("date")
+        group["h2h_avg_runs"] = group["runs"].shift(1).expanding().mean()
+        group["h2h_avg_fp"] = group["fantasy_points"].shift(1).expanding().mean()
+        group["h2h_matches"] = group["match_id"].shift(1).expanding().count()
+        h2h_stats.append(group[["match_id", "player", "h2h_avg_runs",
+                                 "h2h_avg_fp", "h2h_matches"]])
+
+    h2h_df = pd.concat(h2h_stats, ignore_index=True)
+    fantasy = fantasy.merge(h2h_df, on=["match_id", "player"], how="left")
+
+    # Fill NaN with overall player average
+    fantasy["h2h_avg_runs"] = fantasy["h2h_avg_runs"].fillna(
+        fantasy.groupby("player")["runs"].transform(
+            lambda x: x.shift(1).expanding().mean()
+        )
+    )
+    fantasy["h2h_avg_fp"] = fantasy["h2h_avg_fp"].fillna(
+        fantasy.groupby("player")["fantasy_points"].transform(
+            lambda x: x.shift(1).expanding().mean()
+        )
+    )
+    fantasy["h2h_matches"] = fantasy["h2h_matches"].fillna(0)
+
+    return fantasy
+
+
+def add_venue_context(fantasy, matches):
+    """Add venue-level context: avg first innings score, pitch type."""
+
+    # Historical average first innings score at each venue
+    first_innings = fantasy[fantasy["match_id"].isin(matches["id"])].copy()
+
+    venue_batting_avg = matches.groupby("venue")["target_runs"].mean().reset_index()
+    venue_batting_avg.columns = ["venue", "venue_avg_first_score"]
+
+    fantasy = fantasy.merge(venue_batting_avg, on="venue", how="left")
+    fantasy["venue_avg_first_score"] = fantasy["venue_avg_first_score"].fillna(
+        fantasy["venue_avg_first_score"].median()
+    )
+
+    return fantasy
+
+
+def build_feature_matrix(fantasy, deliveries, matches):
+    """Run all feature engineering steps and return final feature matrix."""
+
+    print("  Adding match info...")
+    fantasy = add_match_info(fantasy, deliveries, matches)
+
+    print("  Adding rolling features...")
+    fantasy = add_rolling_features(fantasy)
+
+    print("  Adding venue features...")
+    fantasy = add_venue_features(fantasy)
+
+    print("  Adding head-to-head features...")
+    fantasy = add_h2h_features(fantasy)
+
+    print("  Adding venue context...")
+    fantasy = add_venue_context(fantasy, matches)
+
+    # Fill any remaining NaN with 0
+    feature_cols = [
+        "rolling_avg_runs_5", "rolling_sr_5", "rolling_wickets_5",
+        "rolling_economy_5", "rolling_fp_5", "recent_form_index",
+        "venue_avg_runs", "venue_avg_fp", "venue_matches",
+        "h2h_avg_runs", "h2h_avg_fp", "h2h_matches",
+        "venue_avg_first_score",
+    ]
+    fantasy[feature_cols] = fantasy[feature_cols].fillna(0)
+
+    return fantasy
+
 
 # ============================================================
 # MAIN
@@ -273,19 +504,21 @@ if __name__ == "__main__":
     print("Calculating fantasy points...")
     fantasy = calc_total_fantasy_points(deliveries)
 
+    print("\nBuilding feature matrix...")
+    fantasy = build_feature_matrix(fantasy, deliveries, matches)
+
     # Save
-    out_path = os.path.join(PROCESSED_DIR, "fantasy_points.csv")
+    out_path = os.path.join(PROCESSED_DIR, "feature_matrix.csv")
     fantasy.to_csv(out_path, index=False)
-    print(f"\nSaved: fantasy_points.csv ({fantasy.shape[0]} rows)")
+    print(f"\nSaved: feature_matrix.csv ({fantasy.shape[0]} rows, {fantasy.shape[1]} columns)")
 
-    # Sanity checks
-    print("\n--- Top 10 Fantasy Scores Ever ---")
-    top10 = fantasy.nlargest(10, "fantasy_points")[
-        ["match_id", "player", "runs", "wickets", "catches",
-         "batting_points", "bowling_points", "fielding_points", "fantasy_points"]
+    # Show sample
+    feature_cols = [
+        "player", "fantasy_points", "rolling_avg_runs_5", "rolling_sr_5",
+        "rolling_fp_5", "recent_form_index", "venue_avg_runs", "h2h_avg_runs",
     ]
-    print(top10.to_string(index=False))
+    print("\n--- Sample Feature Matrix (Top 5 rows) ---")
+    print(fantasy[feature_cols].head(10).to_string(index=False))
 
-    print(f"\nAverage fantasy points per player per match: {fantasy['fantasy_points'].mean():.1f}")
-    print(f"Median: {fantasy['fantasy_points'].median():.1f}")
-    print(f"Max: {fantasy['fantasy_points'].max():.1f}")
+    print(f"\n--- Feature Stats ---")
+    print(fantasy[feature_cols[1:]].describe().round(1).to_string())
