@@ -12,7 +12,7 @@ import sys
 
 # Add src to path for imports
 sys.path.insert(0, os.path.dirname(__file__))
-from agent import get_player_recommendation, get_confidence_score
+from agent import get_player_recommendation, get_confidence_score, get_bulk_recommendations
 
 # ============================================================
 # CONFIG
@@ -211,7 +211,7 @@ def show_recommendations(df, model):
                 "player": player,
                 "team": team,
                 "opposition": opposition,
-                "predicted_fp": round(pred, 1),
+                "predicted_fp": round(float(pred), 1),
                 "confidence": confidence,
                 "rolling_fp_5": features.get("rolling_fp_5", 0),
                 "rolling_avg_runs_5": features.get("rolling_avg_runs_5", 0),
@@ -243,7 +243,7 @@ def show_recommendations(df, model):
         x="player",
         y="predicted_fp",
         color="team",
-        text="predicted_fp",
+        text=chart_df["predicted_fp"].apply(lambda x: f"{x:.1f}"),
         title="Predicted Fantasy Points",
         labels={"predicted_fp": "Fantasy Points", "player": "Player"},
     )
@@ -253,8 +253,16 @@ def show_recommendations(df, model):
 
     st.markdown("---")
 
-    # --- AI Recommendations ---
+    # --- AI Recommendations (parallel API calls) ---
     st.subheader("🤖 AI Analysis")
+
+    # Fetch all recommendations in parallel
+    with st.spinner("🧠 Claude AI analyzing players..."):
+        bulk_input = [
+            {"player": p["player"], "stats": p, "predicted_fp": p["predicted_fp"]}
+            for p in top_5
+        ]
+        recommendations = get_bulk_recommendations(bulk_input)
 
     for i, player_data in enumerate(top_5):
         with st.container():
@@ -262,20 +270,11 @@ def show_recommendations(df, model):
 
             with col1:
                 st.markdown(f"### {i + 1}. {player_data['player']} ({player_data['team']})")
-
-                # AI Recommendation
-                try:
-                    rec = get_player_recommendation(
-                        player_data["player"],
-                        player_data,
-                        player_data["predicted_fp"],
-                    )
-                    st.markdown(f"*{rec}*")
-                except Exception as e:
-                    st.markdown(f"*AI analysis unavailable: {e}*")
+                rec = recommendations.get(player_data["player"], "Analysis unavailable.")
+                st.markdown(f"*{rec}*")
 
             with col2:
-                st.metric("Predicted FP", f"{player_data['predicted_fp']}")
+                st.metric("Predicted FP", f"{player_data['predicted_fp']:.1f}")
                 st.progress(player_data["confidence"] / 100)
                 st.caption(f"Confidence: {player_data['confidence']}%")
 

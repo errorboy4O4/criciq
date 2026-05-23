@@ -4,7 +4,7 @@ agent.py - Claude API integration for player recommendations
 
 import anthropic
 import os
-
+from concurrent.futures import ThreadPoolExecutor
 
 def get_player_recommendation(player_name, stats, predicted_points):
     """
@@ -131,6 +131,32 @@ def get_confidence_score(predicted_points, rolling_fp_5, venue_avg_fp):
 
     return confidence
 
+def get_bulk_recommendations(players_data):
+    """
+    Generate recommendations for multiple players in parallel.
+    
+    Args:
+        players_data: list of dicts, each with 'player', 'stats', 'predicted_fp'
+    
+    Returns:
+        dict: {player_name: recommendation_text}
+    """
+
+    def _get_rec(p):
+        try:
+            rec = get_player_recommendation(p["player"], p["stats"], p["predicted_fp"])
+            return p["player"], rec
+        except Exception as e:
+            return p["player"], f"AI analysis unavailable: {e}"
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(_get_rec, p) for p in players_data]
+        for future in futures:
+            name, rec = future.result()
+            results[name] = rec
+
+    return results
 
 # ============================================================
 # TEST
